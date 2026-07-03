@@ -260,7 +260,9 @@ enum UsageFetcher {
         }
 
         if var obj = json {
-            obj["cached_at"] = Date().timeIntervalSince1970
+            // Integer epoch: the statusline script does bash integer
+            // arithmetic on this value, and a fractional number kills it.
+            obj["cached_at"] = Int(Date().timeIntervalSince1970)
             if let data = try? JSONSerialization.data(withJSONObject: obj) {
                 let dir = cacheURL.deletingLastPathComponent()
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

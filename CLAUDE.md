@@ -28,6 +28,8 @@ open ~/Applications/ClaudeUsageWidget.app # 起動
 ## 動作確認のポイント
 
 - 起動確認: `pgrep -x ClaudeUsageWidget`
-- API アクセス確認: `jq -r '.cached_at' ~/.cache/claude-usage-cache.json` が更新されるか（5 分間隔）。
-  小数点付き cached_at = このアプリが書いた、整数 = statusline が書いた
+- API アクセス確認: `jq -r '.cached_at' ~/.cache/claude-usage-cache.json` が更新されるか（5 分間隔）
+- **cached_at は必ず整数で書くこと**: statusline スクリプトが bash の整数演算に使っており、
+  小数を書くと statusline がシェルごと死んで何も表示されなくなる（2026-07-03 に実際に起きた。
+  statusline 側にも `| floor` の防御を入れてあるが、フォーマットは整数を維持する）
 - スクリーンショットでの UI 確認はターミナルの画面収録権限がないと `screencapture` が失敗する
