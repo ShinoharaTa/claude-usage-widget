@@ -8,6 +8,7 @@ DIST="$HOME/Applications"
 BUILD="build"
 
 mkdir -p "$BUILD"
+export CLANG_MODULE_CACHE_PATH="$PWD/$BUILD/module-cache"
 swiftc -O Sources/main.swift -o "$BUILD/$APP_NAME"
 
 APP="$BUILD/$APP_NAME.app"

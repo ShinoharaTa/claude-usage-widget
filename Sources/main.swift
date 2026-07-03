@@ -1,5 +1,4 @@
 import AppKit
-import Security
 import ServiceManagement
 import UserNotifications
 
@@ -60,123 +59,9 @@ func colorFor(pct: Double) -> NSColor {
     return .systemGreen
 }
 
-// MARK: - OAuth credentials (Keychain, shared with Claude Code)
-
-struct OAuthCreds {
-    let accessToken: String
-    let refreshToken: String?
-    let expiresAtMs: Double?
-    let raw: [String: Any]
-
-    var isExpiringSoon: Bool {
-        guard let ms = expiresAtMs else { return false }
-        return ms / 1000 < Date().timeIntervalSince1970 + 60
-    }
-}
-
-enum Keychain {
-    static let service = "Claude Code-credentials"
-    // Claude Code CLI's public OAuth client id
-    static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-
-    static func readCreds() -> OAuthCreds? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-
-        if let oauth = obj["claudeAiOauth"] as? [String: Any],
-           let token = oauth["accessToken"] as? String {
-            return OAuthCreds(
-                accessToken: token,
-                refreshToken: oauth["refreshToken"] as? String,
-                expiresAtMs: (oauth["expiresAt"] as? NSNumber)?.doubleValue,
-                raw: obj
-            )
-        }
-        if let token = (obj["accessToken"] as? String) ?? (obj["access_token"] as? String) {
-            return OAuthCreds(accessToken: token, refreshToken: nil, expiresAtMs: nil, raw: obj)
-        }
-        return nil
-    }
-
-    static func writeCreds(raw: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: raw) else { return }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        let attrs: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
-        if status != errSecSuccess {
-            NSLog("keychain update failed: \(status)")
-        }
-    }
-
-    /// Exchange the refresh token for a new access token and persist the
-    /// rotated tokens back to the keychain so Claude Code keeps working too.
-    static func refresh(_ creds: OAuthCreds) -> OAuthCreds? {
-        guard let rt = creds.refreshToken,
-              let url = URL(string: "https://console.anthropic.com/v1/oauth/token")
-        else { return nil }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 10
-        req.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": clientID,
-        ])
-
-        var json: [String: Any]?
-        let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            guard let http = resp as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode),
-                  let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
-            json = obj
-        }.resume()
-        sem.wait()
-
-        guard let json, let newAccess = json["access_token"] as? String else { return nil }
-
-        var oauth = (creds.raw["claudeAiOauth"] as? [String: Any]) ?? [:]
-        oauth["accessToken"] = newAccess
-        var newRefresh = creds.refreshToken
-        if let r = json["refresh_token"] as? String {
-            oauth["refreshToken"] = r
-            newRefresh = r
-        }
-        var newExpiresMs = creds.expiresAtMs
-        if let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue {
-            newExpiresMs = (Date().timeIntervalSince1970 + expiresIn) * 1000
-            oauth["expiresAt"] = newExpiresMs
-        }
-        var raw = creds.raw
-        raw["claudeAiOauth"] = oauth
-        writeCreds(raw: raw)
-
-        return OAuthCreds(accessToken: newAccess, refreshToken: newRefresh,
-                          expiresAtMs: newExpiresMs, raw: raw)
-    }
-}
-
-// MARK: - Usage fetcher (shares the statusline's cache file)
+// MARK: - Usage reader (statusline cache only)
 
 enum UsageFetcher {
-    static let ttl: TimeInterval = 300 // fetch from the API every 5 minutes
-
     static var cacheURL: URL {
         let base: URL
         if let xdg = ProcessInfo.processInfo.environment["XDG_CACHE_HOME"], !xdg.isEmpty {
@@ -188,89 +73,14 @@ enum UsageFetcher {
     }
 
     static func get(force: Bool) -> Usage? {
-        if !force, let (json, age) = loadCache(), age < ttl {
-            return parse(json)
-        }
-        if let fresh = fetchFromAPI() {
-            return parse(fresh)
-        }
-        if let (json, _) = loadCache() {
-            return parse(json) // stale fallback
-        }
-        return nil
+        loadCache().map(parse)
     }
 
-    private static func loadCache() -> (json: [String: Any], age: TimeInterval)? {
+    private static func loadCache() -> [String: Any]? {
         guard let data = try? Data(contentsOf: cacheURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
-        let cachedAt = (obj["cached_at"] as? NSNumber)?.doubleValue ?? 0
-        return (obj, Date().timeIntervalSince1970 - cachedAt)
-    }
-
-    private static func callUsageAPI(token: String) -> (json: [String: Any]?, status: Int) {
-        guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
-            return (nil, 0)
-        }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.timeoutInterval = 8
-
-        var result: [String: Any]?
-        var status = 0
-        let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            guard let http = resp as? HTTPURLResponse else { return }
-            status = http.statusCode
-            guard (200 ..< 300).contains(http.statusCode), let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
-            result = obj
-        }.resume()
-        sem.wait()
-        return (result, status)
-    }
-
-    private static func fetchFromAPI() -> [String: Any]? {
-        guard var creds = Keychain.readCreds() else { return nil }
-
-        // Proactively refresh if the access token is expired or about to expire.
-        if creds.isExpiringSoon, let refreshed = Keychain.refresh(creds) {
-            creds = refreshed
-        }
-
-        var (json, status) = callUsageAPI(token: creds.accessToken)
-
-        // On 401, Claude Code may have rotated the tokens behind us — re-read
-        // the keychain first, then fall back to our own refresh, and retry once.
-        if json == nil, status == 401 {
-            var retryCreds: OAuthCreds?
-            if let latest = Keychain.readCreds() {
-                if latest.accessToken != creds.accessToken {
-                    retryCreds = latest
-                } else if let refreshed = Keychain.refresh(latest) {
-                    retryCreds = refreshed
-                }
-            }
-            if let retryCreds {
-                (json, _) = callUsageAPI(token: retryCreds.accessToken)
-            }
-        }
-
-        if var obj = json {
-            // Integer epoch: the statusline script does bash integer
-            // arithmetic on this value, and a fractional number kills it.
-            obj["cached_at"] = Int(Date().timeIntervalSince1970)
-            if let data = try? JSONSerialization.data(withJSONObject: obj) {
-                let dir = cacheURL.deletingLastPathComponent()
-                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                try? data.write(to: cacheURL, options: [.atomic])
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cacheURL.path)
-            }
-        }
-        return json
+        return obj
     }
 
     private static func parse(_ json: [String: Any]) -> Usage {
@@ -372,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usageView: UsageView!
     private var usage: Usage?
     private var timer: Timer?
+    private var resetTimers: [String: Timer] = [:]
     private var notificationsAvailable = false
 
     private let widgetSize = NSSize(width: 240, height: 60)
@@ -494,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.target = self
         menu.addItem(toggle)
 
-        let reload = NSMenuItem(title: "今すぐ更新", action: #selector(forceRefresh), keyEquivalent: "r")
+        let reload = NSMenuItem(title: "キャッシュを再読込", action: #selector(forceRefresh), keyEquivalent: "r")
         reload.target = self
         menu.addItem(reload)
 
@@ -588,28 +399,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UNUserNotificationCenter.current().add(req)
     }
 
-    /// Notify once when a known reset time passes. Dedup is keyed on the
-    /// reset's own timestamp so restarts don't re-notify.
-    private func checkResets() {
-        let now = Date()
-        var passed = false
+    private func scheduleResetNotifications(for usage: Usage?) {
+        scheduleResetNotification(name: "5時間", key: "notifiedReset5", resetsAt: usage?.five?.resetsAt)
+        scheduleResetNotification(name: "7日間", key: "notifiedReset7", resetsAt: usage?.seven?.resetsAt)
+    }
 
-        func check(name: String, key: String, resetsAt: Date?) {
-            guard let r = resetsAt, now >= r else { return }
-            let epoch = r.timeIntervalSince1970
-            guard defaults.double(forKey: key) != epoch else { return }
-            defaults.set(epoch, forKey: key)
-            notify(title: "Claude Code", body: "\(name)リミットがリセットされました")
-            passed = true
+    private func scheduleResetNotification(name: String, key: String, resetsAt: Date?) {
+        resetTimers[key]?.invalidate()
+        resetTimers[key] = nil
+
+        guard let resetsAt else { return }
+        let epoch = resetsAt.timeIntervalSince1970
+        guard defaults.double(forKey: key) != epoch else { return }
+
+        let fire = { [weak self] in
+            guard let self, self.defaults.double(forKey: key) != epoch else { return }
+            self.defaults.set(epoch, forKey: key)
+            self.notify(title: "Claude Code", body: "\(name)リミットがリセットされました")
         }
 
-        check(name: "5時間", key: "notifiedReset5", resetsAt: usage?.five?.resetsAt)
-        check(name: "7日間", key: "notifiedReset7", resetsAt: usage?.seven?.resetsAt)
-
-        if passed {
-            // Pull the new window's numbers right away.
-            refresh(force: true)
+        let interval = resetsAt.timeIntervalSinceNow
+        if interval <= 0 {
+            fire()
+            return
         }
+
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.resetTimers[key] = nil
+            fire()
+        }
+        resetTimers[key] = timer
     }
 
     // MARK: Refresh
@@ -627,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.statusItem.button?.attributedTitle = self.makeTitle(usage)
                 self.statusItem.button?.toolTip = self.tooltip(usage)
                 self.usageView.usage = usage
-                self.checkResets()
+                self.scheduleResetNotifications(for: usage)
             }
         }
     }
