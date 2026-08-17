@@ -4,15 +4,36 @@ import UserNotifications
 
 // MARK: - Model
 
+/// How far out a reset is, and therefore how it should be written.
+enum ResetStyle {
+    case clock     // hours away — the wall clock says enough
+    case calendar  // days away — needs the date
+}
+
+/// One rate-limit row. `label` is the compact name shown in the menu bar and
+/// overlay ("5h", "7d", or a per-model cap like "fable"); `severity` is the
+/// API's own grading, which we prefer over local percentage thresholds.
 struct Limit {
+    let label: String
+    let title: String
     let pct: Double
     let resetsAt: Date?
+    let severity: String?
+    let style: ResetStyle
+    /// Stable UserDefaults key for reset-notification dedup across restarts.
+    let notifyKey: String
 }
 
 struct Usage {
-    let five: Limit?
-    let seven: Limit?
+    let limits: [Limit]
     let fetchedAt: Date
+
+    /// Matches the statusline script's threshold: past this the fetcher is
+    /// probably wedged, and the numbers are confidently wrong.
+    static let staleAfter: TimeInterval = 900
+
+    var age: TimeInterval { max(0, Date().timeIntervalSince(fetchedAt)) }
+    var isStale: Bool { age > Usage.staleAfter }
 }
 
 // MARK: - Formatting helpers
@@ -51,12 +72,48 @@ enum Fmt {
         if h > 0 { return "あと\(h)時間\(m)分" }
         return "あと\(m)分"
     }
+
+    /// Compact reset text for the overlay: the clock for the 5h window, the
+    /// date for anything a week out.
+    static func short(_ limit: Limit) -> String {
+        guard let r = limit.resetsAt else { return "" }
+        return limit.style == .clock ? time(r) : day(r)
+    }
+
+    /// Full reset text for the detail menu and tooltip.
+    static func full(_ limit: Limit) -> String {
+        guard let r = limit.resetsAt else { return "" }
+        return limit.style == .clock ? time(r) : dayTime(r)
+    }
 }
 
-func colorFor(pct: Double) -> NSColor {
-    if pct >= 80 { return .systemRed }
-    if pct >= 50 { return .systemYellow }
-    return .systemGreen
+/// The API grades every limit, so prefer its verdict — that keeps the widget,
+/// the menu bar and the statusline script telling the same story. Fallback
+/// thresholds mirror `color_for_pct` in statusline-command.sh.
+func colorFor(_ limit: Limit) -> NSColor {
+    switch limit.severity {
+    case "critical": return .systemRed
+    case "warning": return .systemYellow
+    case "normal": return .systemGreen
+    default:
+        if limit.pct >= 90 { return .systemRed }
+        if limit.pct >= 70 { return .systemYellow }
+        return .systemGreen
+    }
+}
+
+/// Menu-bar text stays in the default color until a limit actually wants
+/// attention — a permanently green menu bar reads as decoration.
+func menuBarColorFor(_ limit: Limit) -> NSColor {
+    switch limit.severity {
+    case "critical": return .systemRed
+    case "warning": return .systemOrange
+    case "normal": return .labelColor
+    default:
+        if limit.pct >= 90 { return .systemRed }
+        if limit.pct >= 70 { return .systemOrange }
+        return .labelColor
+    }
 }
 
 // MARK: - Usage reader (statusline cache only)
@@ -85,19 +142,71 @@ enum UsageFetcher {
 
     private static func parse(_ json: [String: Any]) -> Usage {
         let cachedAt = (json["cached_at"] as? NSNumber)?.doubleValue
+        let rows = json["limits"] as? [[String: Any]] ?? []
+
+        // `five_hour` / `seven_day` carry the percentages, but only the newer
+        // `limits` array carries the API's severity grading for them.
+        func severity(_ kind: String) -> String? {
+            rows.first { $0["kind"] as? String == kind }?["severity"] as? String
+        }
+
+        var limits: [Limit] = []
+        if let five = limit(json["five_hour"], label: "5h", title: "5時間リミット",
+                            severity: severity("session"), style: .clock,
+                            notifyKey: "notifiedReset5") {
+            limits.append(five)
+        }
+        if let seven = limit(json["seven_day"], label: "7d", title: "7日間リミット",
+                             severity: severity("weekly_all"), style: .calendar,
+                             notifyKey: "notifiedReset7") {
+            limits.append(seven)
+        }
+        limits.append(contentsOf: scoped(rows))
+
         return Usage(
-            five: limit(json["five_hour"]),
-            seven: limit(json["seven_day"]),
+            limits: limits,
             fetchedAt: cachedAt.map { Date(timeIntervalSince1970: $0) } ?? Date()
         )
     }
 
-    private static func limit(_ any: Any?) -> Limit? {
+    /// Per-model weekly caps come and go with the plan and have no fixed key,
+    /// so they are read out of the `limits` array. Mirrors the statusline
+    /// script, which picks the same rows the same way.
+    private static func scoped(_ rows: [[String: Any]]) -> [Limit] {
+        rows.compactMap { row in
+            guard row["kind"] as? String == "weekly_scoped" else { return nil }
+            let scope = row["scope"] as? [String: Any]
+            let model = scope?["model"] as? [String: Any]
+            let name = (model?["display_name"] as? String)
+                ?? (scope?["surface"] as? String)
+                ?? "model"
+            let label = name.lowercased()
+            return Limit(
+                label: label,
+                title: "\(label) 週次リミット",
+                pct: (row["percent"] as? NSNumber)?.doubleValue ?? 0,
+                resetsAt: (row["resets_at"] as? String).flatMap(parseISO),
+                severity: row["severity"] as? String,
+                style: .calendar,
+                notifyKey: "notifiedResetScoped:\(label)"
+            )
+        }
+    }
+
+    private static func limit(
+        _ any: Any?, label: String, title: String,
+        severity: String?, style: ResetStyle, notifyKey: String
+    ) -> Limit? {
         guard let d = any as? [String: Any] else { return nil }
-        let pct = (d["utilization"] as? NSNumber)?.doubleValue ?? 0
-        var reset: Date?
-        if let s = d["resets_at"] as? String { reset = parseISO(s) }
-        return Limit(pct: pct, resetsAt: reset)
+        return Limit(
+            label: label,
+            title: title,
+            pct: (d["utilization"] as? NSNumber)?.doubleValue ?? 0,
+            resetsAt: (d["resets_at"] as? String).flatMap(parseISO),
+            severity: severity,
+            style: style,
+            notifyKey: notifyKey
+        )
     }
 
     private static func parseISO(_ s: String) -> Date? {
@@ -122,30 +231,85 @@ final class UsageView: NSView {
         didSet { needsDisplay = true }
     }
 
+    static let width: CGFloat = 240
+    static let rowHeight: CGFloat = 24
+    static let topPadding: CGFloat = 10
+    static let bottomPadding: CGFloat = 2
+    static let staleRowHeight: CGFloat = 15
+
+    /// Placeholder labels drawn when the cache is unreadable, so the widget
+    /// keeps its familiar shape instead of collapsing to nothing.
+    static let placeholderLabels = ["5h", "7d"]
+
+    private static let labelFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+    private static let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+    private static let staleFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
+    private static let dim = NSColor(calibratedWhite: 1.0, alpha: 0.55)
+
+    static func height(rowCount: Int, stale: Bool) -> CGFloat {
+        // No rows means the cache was unreadable and the placeholders get
+        // drawn instead, so reserve room for those rather than for none.
+        let rows = rowCount > 0 ? rowCount : placeholderLabels.count
+        return topPadding + rowHeight * CGFloat(rows)
+            + (stale ? staleRowHeight : 0) + bottomPadding
+    }
+
+    static func size(for usage: Usage?) -> NSSize {
+        NSSize(width: width,
+               height: height(rowCount: usage?.limits.count ?? 0,
+                              stale: usage?.isStale ?? false))
+    }
+
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.10, alpha: 0.85).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
 
-        drawRow(y: 10, label: "5h", limit: usage?.five,
-                resetText: (usage?.five?.resetsAt).map(Fmt.time) ?? "")
-        drawRow(y: 34, label: "7d", limit: usage?.seven,
-                resetText: (usage?.seven?.resetsAt).map(Fmt.day) ?? "")
+        let limits = usage?.limits ?? []
+        let labels = limits.isEmpty ? Self.placeholderLabels : limits.map(\.label)
+        let barX = barStart(labels: labels)
+
+        var y = Self.topPadding
+        if limits.isEmpty {
+            for label in Self.placeholderLabels {
+                drawRow(y: y, label: label, limit: nil, barX: barX)
+                y += Self.rowHeight
+            }
+        } else {
+            for limit in limits {
+                drawRow(y: y, label: limit.label, limit: limit, barX: barX)
+                y += Self.rowHeight
+            }
+        }
+
+        if let u = usage, u.isStale {
+            drawStaleRow(y: y + 1, age: u.age)
+        }
     }
 
-    private func drawRow(y: CGFloat, label: String, limit: Limit?, resetText: String) {
-        let labelFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-        let dim = NSColor(calibratedWhite: 1.0, alpha: 0.55)
+    /// Per-model labels ("fable") are wider than "5h"/"7d", so the bar starts
+    /// after the widest label rather than at a fixed offset. Capped so a long
+    /// model name cannot squeeze the bar out of existence.
+    private func barStart(labels: [String]) -> CGFloat {
+        let widest = labels
+            .map { ($0 as NSString).size(withAttributes: [.font: Self.labelFont]).width }
+            .max() ?? 0
+        return 12 + min(widest.rounded(.up), 62) + 10
+    }
 
-        (label as NSString).draw(at: NSPoint(x: 12, y: y + 1),
-                                 withAttributes: [.font: labelFont, .foregroundColor: dim])
+    private func drawRow(y: CGFloat, label: String, limit: Limit?, barX: CGFloat) {
+        let truncating = NSMutableParagraphStyle()
+        truncating.lineBreakMode = .byTruncatingTail
+        (label as NSString).draw(
+            in: NSRect(x: 12, y: y + 1, width: barX - 22, height: 14),
+            withAttributes: [.font: Self.labelFont, .foregroundColor: Self.dim,
+                             .paragraphStyle: truncating]
+        )
 
         let w = bounds.width
         let resetX = w - 66
         let pctRight = w - 74
-        let barX: CGFloat = 38
         let barW = pctRight - 44 - barX
         let barRect = NSRect(x: barX, y: y + 2, width: barW, height: 12)
 
@@ -153,24 +317,34 @@ final class UsageView: NSView {
         NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6).fill()
 
         let pct = limit.map { min(max($0.pct, 0), 100) } ?? 0
-        if limit != nil, pct > 0 {
+        if let limit, pct > 0 {
             let fillW = max(barW * CGFloat(pct) / 100, 12)
-            colorFor(pct: limit!.pct).setFill()
+            colorFor(limit).setFill()
             NSBezierPath(roundedRect: NSRect(x: barX, y: y + 2, width: fillW, height: 12),
                          xRadius: 6, yRadius: 6).fill()
         }
 
         let pctStr = limit != nil ? String(format: "%.0f%%", pct) : "--"
-        let pctColor = limit.map { colorFor(pct: $0.pct) } ?? dim
-        let pctAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: pctColor]
+        let pctColor = limit.map(colorFor) ?? Self.dim
+        let pctAttrs: [NSAttributedString.Key: Any] = [.font: Self.valueFont, .foregroundColor: pctColor]
         let pctSize = (pctStr as NSString).size(withAttributes: pctAttrs)
         (pctStr as NSString).draw(at: NSPoint(x: pctRight - pctSize.width, y: y + 1),
                                   withAttributes: pctAttrs)
 
+        let resetText = limit.map(Fmt.short) ?? ""
         if !resetText.isEmpty {
             ("→" + resetText as NSString).draw(at: NSPoint(x: resetX, y: y + 1),
-                                               withAttributes: [.font: font, .foregroundColor: dim])
+                                               withAttributes: [.font: Self.valueFont,
+                                                                .foregroundColor: Self.dim])
         }
+    }
+
+    /// A frozen fetcher would otherwise show confident, wrong numbers forever.
+    private func drawStaleRow(y: CGFloat, age: TimeInterval) {
+        let text = "\(Int(age / 60))分前のデータ"
+        (text as NSString).draw(at: NSPoint(x: 12, y: y),
+                                withAttributes: [.font: Self.staleFont,
+                                                 .foregroundColor: NSColor.systemOrange])
     }
 }
 
@@ -185,7 +359,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resetTimers: [String: Timer] = [:]
     private var notificationsAvailable = false
 
-    private let widgetSize = NSSize(width: 240, height: 60)
     private let defaults = UserDefaults.standard
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -242,25 +415,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         let t = NSMutableAttributedString()
 
-        func valueAttrs(_ pct: Double) -> [NSAttributedString.Key: Any] {
-            let c: NSColor = pct >= 80 ? .systemRed : (pct >= 50 ? .systemOrange : .labelColor)
-            return [.font: valueFont, .foregroundColor: c, .baselineOffset: -1]
-        }
-
-        guard let u = usage, u.five != nil || u.seven != nil else {
+        guard let u = usage, !u.limits.isEmpty else {
             t.append(NSAttributedString(string: "CC --", attributes: labelAttrs))
             return t
         }
-        if let f = u.five {
-            t.append(NSAttributedString(string: "5h ", attributes: labelAttrs))
-            t.append(NSAttributedString(string: String(format: "%.0f%%", f.pct),
-                                        attributes: valueAttrs(f.pct)))
-        }
-        if let s = u.seven {
+
+        for limit in u.limits {
             if t.length > 0 { t.append(NSAttributedString(string: "  ", attributes: labelAttrs)) }
-            t.append(NSAttributedString(string: "7d ", attributes: labelAttrs))
-            t.append(NSAttributedString(string: String(format: "%.0f%%", s.pct),
-                                        attributes: valueAttrs(s.pct)))
+            t.append(NSAttributedString(string: limit.label + " ", attributes: labelAttrs))
+            t.append(NSAttributedString(
+                string: String(format: "%.0f%%", limit.pct),
+                attributes: [.font: valueFont,
+                             .foregroundColor: menuBarColorFor(limit),
+                             .baselineOffset: -1]
+            ))
+        }
+        if u.isStale {
+            t.append(NSAttributedString(string: " ⚠", attributes: [
+                .font: labelFont, .foregroundColor: NSColor.systemOrange, .baselineOffset: -1,
+            ]))
         }
         return t
     }
@@ -277,21 +450,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(mi)
         }
 
-        if let u = usage {
-            if let f = u.five {
-                info(String(format: "5時間リミット: %.0f%%", f.pct))
-                if let r = f.resetsAt {
-                    info("　リセット \(Fmt.time(r))（\(Fmt.remain(r))）")
-                }
-            }
-            if let s = u.seven {
-                info(String(format: "7日間リミット: %.0f%%", s.pct))
-                if let r = s.resetsAt {
-                    info("　リセット \(Fmt.dayTime(r))（\(Fmt.remain(r))）")
+        if let u = usage, !u.limits.isEmpty {
+            for limit in u.limits {
+                info(String(format: "%@: %.0f%%", limit.title, limit.pct))
+                if let r = limit.resetsAt {
+                    info("　リセット \(Fmt.full(limit))（\(Fmt.remain(r))）")
                 }
             }
             menu.addItem(.separator())
-            info("データ取得: \(Fmt.clockF.string(from: u.fetchedAt))")
+            var fetched = "データ取得: \(Fmt.clockF.string(from: u.fetchedAt))"
+            if u.isStale {
+                fetched += "（\(Int(u.age / 60))分前・取得が止まっている可能性）"
+            }
+            info(fetched)
         } else {
             info("使用状況を取得できません")
         }
@@ -324,27 +495,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Overlay panel
 
+    /// The panel grows and shrinks with the number of limits, so the remembered
+    /// position is its *top* edge — storing the bottom-left origin would make
+    /// the widget creep down the screen every time the row count changed.
+    private func savedPlacement() -> (x: CGFloat, top: CGFloat)? {
+        guard let x = defaults.object(forKey: "widgetX") as? Double else { return nil }
+        if let top = defaults.object(forKey: "widgetTopY") as? Double {
+            return (CGFloat(x), CGFloat(top))
+        }
+        // Builds before the resizable overlay stored the origin of a fixed
+        // 60pt panel; recover the top edge from it once.
+        if let y = defaults.object(forKey: "widgetY") as? Double {
+            return (CGFloat(x), CGFloat(y) + 60)
+        }
+        return nil
+    }
+
     private func setupPanel() {
-        var origin: NSPoint
+        let size = UsageView.size(for: nil)
+        var x: CGFloat
+        var top: CGFloat
         if let screen = NSScreen.main {
             let vf = screen.visibleFrame
-            origin = NSPoint(x: vf.midX - widgetSize.width / 2,
-                             y: vf.maxY - widgetSize.height - 6)
+            x = vf.midX - size.width / 2
+            top = vf.maxY - 6
         } else {
-            origin = NSPoint(x: 200, y: 600)
+            x = 200
+            top = 600 + size.height
         }
-        if let x = defaults.object(forKey: "widgetX") as? Double,
-           let y = defaults.object(forKey: "widgetY") as? Double {
-            let saved = NSPoint(x: x, y: y)
+        if let saved = savedPlacement() {
+            let rect = NSRect(x: saved.x, y: saved.top - size.height,
+                              width: size.width, height: size.height)
             let onScreen = NSScreen.screens.contains {
-                $0.frame.insetBy(dx: -20, dy: -20)
-                    .contains(NSRect(origin: saved, size: widgetSize))
+                $0.frame.insetBy(dx: -20, dy: -20).contains(rect)
             }
-            if onScreen { origin = saved }
+            if onScreen {
+                x = saved.x
+                top = saved.top
+            }
         }
 
         panel = NSPanel(
-            contentRect: NSRect(origin: origin, size: widgetSize),
+            contentRect: NSRect(x: x, y: top - size.height, width: size.width, height: size.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -357,7 +549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
 
-        usageView = UsageView(frame: NSRect(origin: .zero, size: widgetSize))
+        usageView = UsageView(frame: NSRect(origin: .zero, size: size))
         panel.contentView = usageView
 
         NotificationCenter.default.addObserver(
@@ -366,9 +558,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// Resize in place, keeping the top edge where the user parked it.
+    private func layoutPanel(for usage: Usage?) {
+        let size = UsageView.size(for: usage)
+        var frame = panel.frame
+        guard abs(frame.height - size.height) > 0.5 || abs(frame.width - size.width) > 0.5 else { return }
+        frame.origin.y += frame.height - size.height
+        frame.size = size
+        panel.setFrame(frame, display: true)
+        usageView.frame = NSRect(origin: .zero, size: size)
+    }
+
     @objc private func panelMoved() {
         defaults.set(Double(panel.frame.origin.x), forKey: "widgetX")
-        defaults.set(Double(panel.frame.origin.y), forKey: "widgetY")
+        defaults.set(Double(panel.frame.maxY), forKey: "widgetTopY")
     }
 
     @objc private func toggleWidget() {
@@ -399,37 +602,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UNUserNotificationCenter.current().add(req)
     }
 
+    /// A per-model weekly cap usually resets with the all-model window, so
+    /// limits are grouped by reset moment and announced once per moment
+    /// instead of once per limit.
     private func scheduleResetNotifications(for usage: Usage?) {
-        scheduleResetNotification(name: "5時間", key: "notifiedReset5", resetsAt: usage?.five?.resetsAt)
-        scheduleResetNotification(name: "7日間", key: "notifiedReset7", resetsAt: usage?.seven?.resetsAt)
+        resetTimers.values.forEach { $0.invalidate() }
+        resetTimers.removeAll()
+        guard let usage else { return }
+
+        var groups: [Int: [Limit]] = [:]
+        for limit in usage.limits {
+            guard let r = limit.resetsAt else { continue }
+            groups[Int(r.timeIntervalSince1970.rounded()), default: []].append(limit)
+        }
+        for (epoch, limits) in groups {
+            scheduleResetNotification(epoch: epoch, limits: limits)
+        }
     }
 
-    private func scheduleResetNotification(name: String, key: String, resetsAt: Date?) {
-        resetTimers[key]?.invalidate()
-        resetTimers[key] = nil
+    private func scheduleResetNotification(epoch: Int, limits: [Limit]) {
+        let stamp = Double(epoch)
+        // Capture the defaults store rather than self: these closures outlive
+        // the call inside a Timer, and holding self there would retain it.
+        let defaults = self.defaults
+        let unseen = { limits.contains { defaults.double(forKey: $0.notifyKey) != stamp } }
+        guard unseen() else { return }
 
-        guard let resetsAt else { return }
-        let epoch = resetsAt.timeIntervalSince1970
-        guard defaults.double(forKey: key) != epoch else { return }
+        let markSeen = { limits.forEach { defaults.set(stamp, forKey: $0.notifyKey) } }
 
-        let fire = { [weak self] in
-            guard let self, self.defaults.double(forKey: key) != epoch else { return }
-            self.defaults.set(epoch, forKey: key)
-            self.notify(title: "Claude Code", body: "\(name)リミットがリセットされました")
-        }
-
-        let interval = resetsAt.timeIntervalSinceNow
+        let interval = stamp - Date().timeIntervalSince1970
         if interval <= 0 {
-            fire()
+            // The reset already happened — the cache was simply lagging behind
+            // it. Announcing it now would be noise, so just record it.
+            markSeen()
             return
         }
 
-        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+        let key = String(epoch)
+        resetTimers[key] = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             guard let self else { return }
             self.resetTimers[key] = nil
-            fire()
+            guard unseen() else { return }
+            markSeen()
+            let names = limits.map(\.label).joined(separator: " / ")
+            self.notify(title: "Claude Code", body: "\(names) のリミットがリセットされました")
         }
-        resetTimers[key] = timer
     }
 
     // MARK: Refresh
@@ -446,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.usage = usage
                 self.statusItem.button?.attributedTitle = self.makeTitle(usage)
                 self.statusItem.button?.toolTip = self.tooltip(usage)
+                self.layoutPanel(for: usage)
                 self.usageView.usage = usage
                 self.scheduleResetNotifications(for: usage)
             }
@@ -453,17 +671,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func tooltip(_ u: Usage?) -> String {
-        guard let u else { return "Claude Code の使用状況を取得できません" }
-        var lines: [String] = []
-        if let f = u.five {
-            var l = String(format: "5時間リミット: %.0f%%", f.pct)
-            if let r = f.resetsAt { l += "（リセット \(Fmt.time(r))）" }
-            lines.append(l)
+        guard let u, !u.limits.isEmpty else { return "Claude Code の使用状況を取得できません" }
+        var lines = u.limits.map { limit -> String in
+            var l = String(format: "%@: %.0f%%", limit.title, limit.pct)
+            if limit.resetsAt != nil { l += "（リセット \(Fmt.full(limit))）" }
+            return l
         }
-        if let s = u.seven {
-            var l = String(format: "7日間リミット: %.0f%%", s.pct)
-            if let r = s.resetsAt { l += "（リセット \(Fmt.dayTime(r))）" }
-            lines.append(l)
+        if u.isStale {
+            lines.append("※ \(Int(u.age / 60))分前のデータ（取得が止まっている可能性）")
         }
         return lines.joined(separator: "\n")
     }
