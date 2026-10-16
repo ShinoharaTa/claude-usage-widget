@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 import UserNotifications
 
 // MARK: - Model
@@ -9,10 +8,24 @@ struct Limit {
     let resetsAt: Date?
 }
 
+/// A per-model weekly cap ("fable"). These come and go with the plan, so the
+/// row count is per account rather than fixed.
+struct ScopedLimit {
+    let name: String
+    let limit: Limit
+}
+
 struct Usage {
     let five: Limit?
     let seven: Limit?
+    let scoped: [ScopedLimit]
     let fetchedAt: Date
+    /// Short account name written by fetch-usage.sh ("takuma1201", "asteno").
+    let label: String
+    let email: String
+    /// True for the default config dir (~/.claude). Sorted first, and the one
+    /// the menu bar shows when several accounts are present.
+    let isDefault: Bool
 }
 
 // MARK: - Formatting helpers
@@ -62,34 +75,70 @@ func colorFor(pct: Double) -> NSColor {
 // MARK: - Usage reader (statusline cache only)
 
 enum UsageFetcher {
-    static var cacheURL: URL {
-        let base: URL
+    static var cacheDir: URL {
         if let xdg = ProcessInfo.processInfo.environment["XDG_CACHE_HOME"], !xdg.isEmpty {
-            base = URL(fileURLWithPath: xdg)
-        } else {
-            base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache")
+            return URL(fileURLWithPath: xdg)
         }
-        return base.appendingPathComponent("claude-usage-cache.json")
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache")
     }
 
-    static func get(force: Bool) -> Usage? {
-        loadCache().map(parse)
+    /// One cache per account. fetch-usage.sh names them the way Claude Code
+    /// namespaces its Keychain items: `claude-usage-cache.json` for the default
+    /// config dir, `claude-usage-cache-<sha256(dir)[0:8]>.json` for any other.
+    /// Discovering them by glob means adding a third account needs no code change.
+    static func all() -> [Usage] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: cacheDir.path) else { return [] }
+        let found = names
+            .filter { $0.hasPrefix("claude-usage-cache") && $0.hasSuffix(".json") }
+            .compactMap { name -> Usage? in
+                guard let data = try? Data(contentsOf: cacheDir.appendingPathComponent(name)),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return nil }
+                return parse(obj, fallbackLabel: name)
+            }
+        return found.sorted { a, b in
+            if a.isDefault != b.isDefault { return a.isDefault }
+            return a.label < b.label
+        }
     }
 
-    private static func loadCache() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: cacheURL),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        return obj
-    }
-
-    private static func parse(_ json: [String: Any]) -> Usage {
+    private static func parse(_ json: [String: Any], fallbackLabel: String) -> Usage {
         let cachedAt = (json["cached_at"] as? NSNumber)?.doubleValue
+        let account = json["account"] as? [String: Any]
+        // config_dir is "" for the default account; a cache written before
+        // fetch-usage.sh started recording accounts has no block at all.
+        let dir = account?["config_dir"] as? String
+        let label = (account?["label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? fallbackLabel
         return Usage(
             five: limit(json["five_hour"]),
             seven: limit(json["seven_day"]),
-            fetchedAt: cachedAt.map { Date(timeIntervalSince1970: $0) } ?? Date()
+            scoped: scopedLimits(json["limits"]),
+            fetchedAt: cachedAt.map { Date(timeIntervalSince1970: $0) } ?? Date(),
+            label: label,
+            email: account?["email"] as? String ?? "",
+            isDefault: (dir ?? "").isEmpty
         )
+    }
+
+    /// Scoped caps live in `limits[]` and carry `percent` rather than
+    /// `utilization` — same shape the statusline reads.
+    private static func scopedLimits(_ any: Any?) -> [ScopedLimit] {
+        guard let arr = any as? [[String: Any]] else { return [] }
+        return arr.compactMap { entry in
+            guard entry["kind"] as? String == "weekly_scoped" else { return nil }
+            let scope = entry["scope"] as? [String: Any]
+            let model = scope?["model"] as? [String: Any]
+            let name = (model?["display_name"] as? String)
+                ?? (scope?["surface"] as? String)
+                ?? "model"
+            var reset: Date?
+            if let s = entry["resets_at"] as? String { reset = parseISO(s) }
+            let pct = (entry["percent"] as? NSNumber)?.doubleValue ?? 0
+            return ScopedLimit(name: name.lowercased(),
+                               limit: Limit(pct: pct, resetsAt: reset))
+        }
     }
 
     private static func limit(_ any: Any?) -> Limit? {
@@ -118,34 +167,109 @@ enum UsageFetcher {
 // MARK: - Overlay widget view
 
 final class UsageView: NSView {
-    var usage: Usage? {
+    var usages: [Usage] = [] {
         didSet { needsDisplay = true }
     }
 
+    /// A single account with no scoped caps keeps the original 60pt layout and
+    /// no header — the common case should look exactly as it always has.
+    /// Everything else stacks: per account a header plus one row per limit.
+    static let rowHeight: CGFloat = 24
+    static let headerHeight: CGFloat = 16
+    static let blockGap: CGFloat = 4
+    static let topPad: CGFloat = 6
+
+    static let labelFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+
+    /// 5h + 7d + however many per-model caps the plan currently exposes.
+    static func rows(for u: Usage) -> [(String, Limit?, String)] {
+        var out: [(String, Limit?, String)] = [
+            ("5h", u.five, (u.five?.resetsAt).map(Fmt.time) ?? ""),
+            ("7d", u.seven, (u.seven?.resetsAt).map(Fmt.day) ?? ""),
+        ]
+        for s in u.scoped {
+            out.append((s.name, s.limit, s.limit.resetsAt.map(Fmt.day) ?? ""))
+        }
+        return out
+    }
+
+    static func height(for usages: [Usage]) -> CGFloat {
+        guard let first = usages.first else { return 60 }
+        if usages.count == 1 {
+            return 12 + CGFloat(rows(for: first).count) * rowHeight
+        }
+        return topPad + usages.reduce(CGFloat(0)) {
+            $0 + headerHeight + CGFloat(rows(for: $1).count) * rowHeight + blockGap
+        }
+    }
+
     override var isFlipped: Bool { true }
+
+    /// Bars start after the widest row label so "fable" cannot run into them,
+    /// and every account shares one column so the bars stay aligned.
+    private var barX: CGFloat {
+        let widest = usages.flatMap(Self.rows).reduce(CGFloat(0)) { acc, row in
+            max(acc, (row.0 as NSString).size(withAttributes: [.font: Self.labelFont]).width)
+        }
+        return max(38, 12 + widest.rounded(.up) + 6)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.10, alpha: 0.85).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
 
-        drawRow(y: 10, label: "5h", limit: usage?.five,
-                resetText: (usage?.five?.resetsAt).map(Fmt.time) ?? "")
-        drawRow(y: 34, label: "7d", limit: usage?.seven,
-                resetText: (usage?.seven?.resetsAt).map(Fmt.day) ?? "")
+        let x = barX
+
+        guard let first = usages.first else {
+            drawRow(y: 10, label: "5h", limit: nil, resetText: "", barX: x)
+            drawRow(y: 34, label: "7d", limit: nil, resetText: "", barX: x)
+            return
+        }
+
+        if usages.count == 1 {
+            var y: CGFloat = 10
+            for (label, limit, reset) in Self.rows(for: first) {
+                drawRow(y: y, label: label, limit: limit, resetText: reset, barX: x)
+                y += Self.rowHeight
+            }
+            return
+        }
+
+        var top = Self.topPad
+        for (i, u) in usages.enumerated() {
+            if i > 0 {
+                NSColor(calibratedWhite: 1.0, alpha: 0.12).setFill()
+                NSBezierPath.fill(NSRect(x: 12, y: top - 3, width: bounds.width - 24, height: 1))
+            }
+            drawHeader(y: top, text: u.label, isDefault: u.isDefault)
+            var y = top + Self.headerHeight
+            for (label, limit, reset) in Self.rows(for: u) {
+                drawRow(y: y, label: label, limit: limit, resetText: reset, barX: x)
+                y += Self.rowHeight
+            }
+            top = y + Self.blockGap
+        }
     }
 
-    private func drawRow(y: CGFloat, label: String, limit: Limit?, resetText: String) {
-        let labelFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+    private func drawHeader(y: CGFloat, text: String, isDefault: Bool) {
+        let font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        let color = isDefault
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.75)
+            : NSColor.systemTeal
+        (text as NSString).draw(at: NSPoint(x: 12, y: y),
+                                withAttributes: [.font: font, .foregroundColor: color])
+    }
+
+    private func drawRow(y: CGFloat, label: String, limit: Limit?, resetText: String, barX: CGFloat) {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         let dim = NSColor(calibratedWhite: 1.0, alpha: 0.55)
 
         (label as NSString).draw(at: NSPoint(x: 12, y: y + 1),
-                                 withAttributes: [.font: labelFont, .foregroundColor: dim])
+                                 withAttributes: [.font: Self.labelFont, .foregroundColor: dim])
 
         let w = bounds.width
         let resetX = w - 66
         let pctRight = w - 74
-        let barX: CGFloat = 38
         let barW = pctRight - 44 - barX
         let barRect = NSRect(x: barX, y: y + 2, width: barW, height: 12)
 
@@ -180,12 +304,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
     private var usageView: UsageView!
-    private var usage: Usage?
+    private var usages: [Usage] = []
     private var timer: Timer?
     private var resetTimers: [String: Timer] = [:]
     private var notificationsAvailable = false
 
-    private let widgetSize = NSSize(width: 240, height: 60)
+    private let widgetWidth: CGFloat = 240
+    private var widgetSize: NSSize {
+        NSSize(width: widgetWidth, height: UsageView.height(for: usages))
+    }
+    /// The account the menu bar reports. There is no room for several, so it
+    /// tracks the default one; the panel and the menu carry the rest.
+    private var primary: Usage? { usages.first }
     private let defaults = UserDefaults.standard
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -277,23 +407,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(mi)
         }
 
-        if let u = usage {
-            if let f = u.five {
-                info(String(format: "5時間リミット: %.0f%%", f.pct))
-                if let r = f.resetsAt {
-                    info("　リセット \(Fmt.time(r))（\(Fmt.remain(r))）")
-                }
-            }
-            if let s = u.seven {
-                info(String(format: "7日間リミット: %.0f%%", s.pct))
-                if let r = s.resetsAt {
-                    info("　リセット \(Fmt.dayTime(r))（\(Fmt.remain(r))）")
-                }
-            }
-            menu.addItem(.separator())
-            info("データ取得: \(Fmt.clockF.string(from: u.fetchedAt))")
-        } else {
+        if usages.isEmpty {
             info("使用状況を取得できません")
+        } else {
+            for (i, u) in usages.enumerated() {
+                if i > 0 { menu.addItem(.separator()) }
+                if usages.count > 1 {
+                    info(u.email.isEmpty ? u.label : "\(u.label) — \(u.email)")
+                }
+                if let f = u.five {
+                    info(String(format: "5時間リミット: %.0f%%", f.pct))
+                    if let r = f.resetsAt {
+                        info("　リセット \(Fmt.time(r))（\(Fmt.remain(r))）")
+                    }
+                }
+                if let s = u.seven {
+                    info(String(format: "7日間リミット: %.0f%%", s.pct))
+                    if let r = s.resetsAt {
+                        info("　リセット \(Fmt.dayTime(r))（\(Fmt.remain(r))）")
+                    }
+                }
+                for sc in u.scoped {
+                    info(String(format: "%@ 週次リミット: %.0f%%", sc.name, sc.limit.pct))
+                    if let r = sc.limit.resetsAt {
+                        info("　リセット \(Fmt.dayTime(r))（\(Fmt.remain(r))）")
+                    }
+                }
+            }
+            if let newest = usages.map({ $0.fetchedAt }).max() {
+                menu.addItem(.separator())
+                info("データ取得: \(Fmt.clockF.string(from: newest))")
+            }
         }
 
         menu.addItem(.separator())
@@ -313,7 +457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let login = NSMenuItem(title: "ログイン時に自動起動", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        login.state = LaunchAgent.isEnabled ? .on : .off
         menu.addItem(login)
 
         let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -399,9 +543,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UNUserNotificationCenter.current().add(req)
     }
 
-    private func scheduleResetNotifications(for usage: Usage?) {
-        scheduleResetNotification(name: "5時間", key: "notifiedReset5", resetsAt: usage?.five?.resetsAt)
-        scheduleResetNotification(name: "7日間", key: "notifiedReset7", resetsAt: usage?.seven?.resetsAt)
+    /// Keys are per account so two accounts' windows cannot dedupe each other
+    /// away. The default account keeps its original keys, so the "already
+    /// notified" state written by earlier builds still applies.
+    private func scheduleResetNotifications(for usage: Usage) {
+        let suffix = usage.isDefault ? "" : "-\(usage.label)"
+        let who = usages.count > 1 ? "\(usage.label) の" : ""
+        scheduleResetNotification(name: "\(who)5時間", key: "notifiedReset5\(suffix)",
+                                  resetsAt: usage.five?.resetsAt)
+        scheduleResetNotification(name: "\(who)7日間", key: "notifiedReset7\(suffix)",
+                                  resetsAt: usage.seven?.resetsAt)
+        for sc in usage.scoped {
+            scheduleResetNotification(name: "\(who)\(sc.name) 週次",
+                                      key: "notifiedResetScoped:\(sc.name)\(suffix)",
+                                      resetsAt: sc.limit.resetsAt)
+        }
     }
 
     private func scheduleResetNotification(name: String, key: String, resetsAt: Date?) {
@@ -440,30 +596,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refresh(force: Bool) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let usage = UsageFetcher.get(force: force)
+            let fetched = UsageFetcher.all()
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.usage = usage
-                self.statusItem.button?.attributedTitle = self.makeTitle(usage)
-                self.statusItem.button?.toolTip = self.tooltip(usage)
-                self.usageView.usage = usage
-                self.scheduleResetNotifications(for: usage)
+                self.usages = fetched
+                self.statusItem.button?.attributedTitle = self.makeTitle(self.primary)
+                self.statusItem.button?.toolTip = self.tooltip()
+                self.usageView.usages = fetched
+                // Accounts and per-model caps both come and go, so let the
+                // resize guard decide rather than watching the account count.
+                self.resizePanel()
+                for u in fetched { self.scheduleResetNotifications(for: u) }
             }
         }
     }
 
-    private func tooltip(_ u: Usage?) -> String {
-        guard let u else { return "Claude Code の使用状況を取得できません" }
+    /// An account appearing or disappearing changes the panel height. Keep the
+    /// top edge where the user put it so the widget grows downward instead of
+    /// jumping — panel coordinates are bottom-left, hence the origin shift.
+    private func resizePanel() {
+        let size = widgetSize
+        var frame = panel.frame
+        guard frame.size != size else { return }
+        frame.origin.y += frame.size.height - size.height
+        frame.size = size
+        panel.setFrame(frame, display: true)
+        usageView.frame = NSRect(origin: .zero, size: size)
+        panelMoved()
+    }
+
+    private func tooltip() -> String {
+        guard !usages.isEmpty else { return "Claude Code の使用状況を取得できません" }
         var lines: [String] = []
-        if let f = u.five {
-            var l = String(format: "5時間リミット: %.0f%%", f.pct)
-            if let r = f.resetsAt { l += "（リセット \(Fmt.time(r))）" }
-            lines.append(l)
-        }
-        if let s = u.seven {
-            var l = String(format: "7日間リミット: %.0f%%", s.pct)
-            if let r = s.resetsAt { l += "（リセット \(Fmt.dayTime(r))）" }
-            lines.append(l)
+        for u in usages {
+            if usages.count > 1 {
+                lines.append(u.email.isEmpty ? u.label : "\(u.label)（\(u.email)）")
+            }
+            if let f = u.five {
+                var l = String(format: "5時間リミット: %.0f%%", f.pct)
+                if let r = f.resetsAt { l += "（リセット \(Fmt.time(r))）" }
+                lines.append(l)
+            }
+            if let s = u.seven {
+                var l = String(format: "7日間リミット: %.0f%%", s.pct)
+                if let r = s.resetsAt { l += "（リセット \(Fmt.dayTime(r))）" }
+                lines.append(l)
+            }
+            for sc in u.scoped {
+                var l = String(format: "%@ 週次リミット: %.0f%%", sc.name, sc.limit.pct)
+                if let r = sc.limit.resetsAt { l += "（リセット \(Fmt.dayTime(r))）" }
+                lines.append(l)
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -471,12 +654,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Login item
 
     @objc private func toggleLoginItem() {
-        let svc = SMAppService.mainApp
         do {
-            if svc.status == .enabled {
-                try svc.unregister()
+            if LaunchAgent.isEnabled {
+                try LaunchAgent.disable()
             } else {
-                try svc.register()
+                try LaunchAgent.enable()
+                // Hand over to the instance launchd starts, so KeepAlive
+                // covers this session too and only one icon remains.
+                if try LaunchAgent.bootstrap() { NSApp.terminate(nil) }
             }
         } catch {
             NSLog("login item toggle failed: \(error)")
@@ -484,7 +669,143 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Login item (launchd)
+
+/// Auto-start is a LaunchAgent in ~/Library/LaunchAgents, not SMAppService.
+/// The bundle is ad-hoc signed and replaced in place by build.sh, and the
+/// SMAppService registration did not survive that: after the 2026-10-12 reboot
+/// the app never came back. launchd also relaunches the app when it crashes or
+/// is killed (KeepAlive on unsuccessful exit); a normal 終了 stays quit.
+enum LaunchAgent {
+    static let label = "com.shino3.claude-usage-widget"
+    static let stderrPath = "/tmp/claude-usage-widget.err"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+    static var domain: String { "gui/\(getuid())" }
+    static var service: String { "\(domain)/\(label)" }
+
+    /// Enabled means the plist exists; that is all launchd looks at on login.
+    static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+
+    /// launchd currently has the agent loaded (running or not).
+    static var isLoaded: Bool { launchctl(["print", service]).status == 0 }
+
+    /// PID of the instance launchd manages, nil when it is not running.
+    static var managedPID: pid_t? {
+        for line in launchctl(["print", service]).output.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("pid = "), let pid = pid_t(t.dropFirst("pid = ".count)) { return pid }
+        }
+        return nil
+    }
+
+    /// Writes the plist pointing at this executable. Does not load it.
+    static func enable() throws {
+        guard let exe = Bundle.main.executablePath else { throw Failure("executable path unknown") }
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [exe],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua",
+            "StandardErrorPath": stderrPath,
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try data.write(to: plistURL, options: .atomic)
+        // A leftover `launchctl disable` would make launchd skip the plist at login.
+        _ = launchctl(["enable", service])
+    }
+
+    /// Loads the agent now, which starts the app (RunAtLoad).
+    /// Returns false when it was already loaded.
+    @discardableResult
+    static func bootstrap() throws -> Bool {
+        if isLoaded { return false }
+        let r = launchctl(["bootstrap", domain, plistURL.path])
+        guard r.status == 0 else {
+            throw Failure("launchctl bootstrap failed (\(r.status)): \(r.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return true
+    }
+
+    /// Removes the plist only. A loaded agent stays loaded until logout;
+    /// booting it out would kill the instance the user is looking at.
+    static func disable() throws {
+        guard isEnabled else { return }
+        try FileManager.default.removeItem(at: plistURL)
+    }
+
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
+    @discardableResult
+    static func launchctl(_ args: [String]) -> (status: Int32, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, "\(error)") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+}
+
+/// `ClaudeUsageWidget --enable-login-item` and friends: manage the LaunchAgent
+/// from a terminal (build.sh and the README use these) and exit without UI.
+enum LoginItemCLI {
+    static let usage = "usage: ClaudeUsageWidget [--enable-login-item | --disable-login-item | --login-item-status]"
+
+    static func run(_ flag: String) -> Int32 {
+        do {
+            switch flag {
+            case "--enable-login-item":
+                try LaunchAgent.enable()
+                // An instance started by hand would otherwise sit next to the launchd one.
+                let managed = LaunchAgent.managedPID
+                let bid = Bundle.main.bundleIdentifier ?? ""
+                for a in NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+                where a.processIdentifier != getpid() && a.processIdentifier != managed {
+                    kill(a.processIdentifier, SIGTERM)
+                }
+                let started = try LaunchAgent.bootstrap()
+                print("login item enabled: \(LaunchAgent.plistURL.path)"
+                      + (started ? " (started)" : " (already loaded)"))
+            case "--disable-login-item":
+                try LaunchAgent.disable()
+                print("login item disabled"
+                      + (LaunchAgent.isLoaded ? " (the running agent stays loaded until logout)" : ""))
+            case "--login-item-status":
+                print("enabled: \(LaunchAgent.isEnabled)  loaded: \(LaunchAgent.isLoaded)"
+                      + "  pid: \(LaunchAgent.managedPID.map(String.init) ?? "-")")
+            default:
+                FileHandle.standardError.write(Data((usage + "\n").utf8))
+                return 64
+            }
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("\(flag): \(error)\n".utf8))
+            return 1
+        }
+    }
+}
+
 // MARK: - Entry point
+
+// Only `--flags` count; Launch Services may pass other arguments of its own.
+if let flag = CommandLine.arguments.dropFirst().first(where: { $0.hasPrefix("--") }) {
+    exit(LoginItemCLI.run(flag))
+}
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

@@ -13,7 +13,7 @@ Claude Code のレートリミット（5時間 / 7日間）を Mac のメニュ�
 - **右クリック**（または ⌃クリック）→ 詳細メニュー
   - 使用率・リセット時刻・リセットまでの残り時間
   - ウィジェット表示切り替え / キャッシュ再読込
-  - ログイン時に自動起動（トグル）
+  - ログイン時に自動起動（トグル。下記「自動起動」）
   - 終了
 
 ## 通知
@@ -38,7 +38,25 @@ API アクセス、OAuth トークン取得、トークン更新はアプリ側�
 
 ```sh
 ./build.sh        # swiftc でビルド → ~/Applications/ClaudeUsageWidget.app に配置
-open ~/Applications/ClaudeUsageWidget.app
+~/Applications/ClaudeUsageWidget.app/Contents/MacOS/ClaudeUsageWidget --enable-login-item   # 初回: 自動起動を有効にして起動
 ```
 
 依存は Xcode Command Line Tools の swiftc のみ。
+自動起動を有効にしてあれば、2 回目以降の `./build.sh` は新しいビルドを launchd 経由で起動し直す。
+
+## 自動起動
+
+ログイン時の起動と、落ちたときの再起動は launchd の LaunchAgent
+`~/Library/LaunchAgents/com.shino3.claude-usage-widget.plist` が受け持つ（SMAppService は使わない。
+ad-hoc 署名のバンドルを build.sh が丸ごと置き換えるため、登録が残らなかった）。
+メニューの「ログイン時に自動起動」はこの plist の有無を切り替える。ターミナルからは:
+
+```sh
+BIN=~/Applications/ClaudeUsageWidget.app/Contents/MacOS/ClaudeUsageWidget
+$BIN --enable-login-item    # plist を書き、launchd 管理で今すぐ起動（手動起動中のものは置き換える）
+$BIN --disable-login-item   # plist を消す。動作中のものは次回ログアウトまでそのまま
+$BIN --login-item-status    # enabled / loaded / pid
+```
+
+- クラッシュや `pkill` で死んだときは launchd が起動し直す。メニューの「終了」（正常終了）では起動し直さない
+- アプリの stderr は `/tmp/claude-usage-widget.err`
